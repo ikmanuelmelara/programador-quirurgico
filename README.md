@@ -2,7 +2,7 @@
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/TU_USUARIO/programador-quirurgico/blob/main/notebooks/Programador_Quirurgico_v49.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ikmanuelmelara/programador-quirurgico/blob/main/notebooks/Programador_Quirurgico_v49.ipynb)
 
 Sistema avanzado de **optimización para programación quirúrgica** con Machine Learning, simulación Monte Carlo y criterios de priorización del sistema público de salud de Catalunya (CatSalut).
 
@@ -55,7 +55,7 @@ Sistema avanzado de **optimización para programación quirúrgica** con Machine
 
 ```bash
 # Clonar repositorio
-git clone https://github.com/TU_USUARIO/programador-quirurgico.git
+git clone https://github.com/ikmanuelmelara/programador-quirurgico.git
 cd programador-quirurgico
 
 # Crear entorno virtual
@@ -186,9 +186,9 @@ Este proyecto está bajo la Licencia MIT - ver [LICENSE](LICENSE) para detalles.
 
 ## 📧 Contacto
 
-**Tu Nombre** - [@tu_twitter](https://twitter.com/tu_twitter) - tu@email.com
+**Manuel Melara Otamendi** - ik.manuel.melara@gmail.com
 
-Link del proyecto: [https://github.com/TU_USUARIO/programador-quirurgico](https://github.com/TU_USUARIO/programador-quirurgico)
+Link del proyecto: [https://github.com/TU_USUARIO/programador-quirurgico](https://github.com/ikmanuelmelara/programador-quirurgico)
 
 ---
 
