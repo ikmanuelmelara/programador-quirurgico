@@ -722,8 +722,33 @@ class SimuladorWhatIf:
         )
         
         self.optimizador = OptimizadorInverso(self.simulador_mc, self.modelo_capacidad)
-    
-    def simular_escenario(self, escenario: Escenario, 
+        self.prescriptor = None  # Se inicializa con set_flujo_predicho()
+
+    def set_flujo_predicho(self, flujo_predicho: Dict[str, Dict[str, float]]):
+        """
+        Conecta el flujo predicho (del PredictorDemanda) al prescriptor.
+        Debe llamarse después de entrenar el predictor de demanda.
+
+        Args:
+            flujo_predicho: Resultado de PredictorDemanda.obtener_flujo_semanal()
+        """
+        self.prescriptor = OptimizadorPrescriptivo(
+            self.simulador_mc, self.modelo_capacidad, flujo_predicho
+        )
+
+    def prescribir(self, objetivo: 'ObjetivoPrescripcion') -> 'ResultadoPrescripcion':
+        """
+        Ejecuta la prescripción: calcula la configuración óptima para un objetivo.
+        Requiere haber llamado set_flujo_predicho() previamente.
+        """
+        if self.prescriptor is None:
+            raise RuntimeError(
+                "Primero ejecuta la predicción para alimentar al prescriptor. "
+                "Llama a set_flujo_predicho() con el resultado del predictor."
+            )
+        return self.prescriptor.prescribir(objetivo)
+
+    def simular_escenario(self, escenario: Escenario,
                           n_simulaciones: int = 500) -> ResultadoSimulacion:
         """Simula un escenario y devuelve resultados"""
         return self.simulador_mc.simular(escenario, n_simulaciones)
@@ -825,6 +850,328 @@ class SimuladorWhatIf:
                 lineas.append(f"- {rec}")
         
         return "\n".join(lineas)
+
+
+# =============================================================================
+# OPTIMIZADOR PRESCRIPTIVO
+# =============================================================================
+
+class TipoObjetivo(Enum):
+    """Tipos de objetivo para la prescripción"""
+    ELIMINAR_FUERA_PLAZO = "eliminar_fuera_plazo"
+    REDUCIR_FUERA_PLAZO = "reducir_fuera_plazo"
+    EQUILIBRAR_FLUJO = "equilibrar_flujo"
+    REDUCIR_LISTA = "reducir_lista"
+
+
+@dataclass
+class ObjetivoPrescripcion:
+    """Define los objetivos del usuario para la prescripción"""
+    tipo: TipoObjetivo
+
+    # Para REDUCIR_FUERA_PLAZO: porcentaje objetivo (0-100)
+    reduccion_fp_pct: float = 100.0
+
+    # Para REDUCIR_LISTA: porcentaje de reducción deseado
+    reduccion_lista_pct: float = 0.0
+
+    # Horizonte temporal en semanas
+    semanas: int = 12
+
+    # Nivel de confianza requerido (0.0 - 1.0)
+    confianza: float = 0.8
+
+    # Máximo de sesiones extra tolerables por especialidad
+    max_sesiones_extra: int = 10
+
+
+@dataclass
+class ResultadoPrescripcion:
+    """Resultado de la optimización prescriptiva"""
+    objetivo: ObjetivoPrescripcion
+
+    # Configuración recomendada: {especialidad: sesiones_extra}
+    sesiones_recomendadas: Dict[str, int]
+
+    # Métricas proyectadas con la configuración recomendada
+    lista_final_esperada: float
+    fp_final_esperado: float
+    prob_exito: float
+
+    # Flujo de entrada usado (del predictor)
+    flujo_entrada: Dict[str, float]
+
+    # Capacidad actual y recomendada: {esp: {'actual': n, 'recomendada': n}}
+    comparacion_capacidad: Dict[str, Dict[str, float]]
+
+    # Simulación completa del escenario recomendado
+    simulacion: Optional[ResultadoSimulacion] = None
+
+    # Mensajes explicativos
+    explicacion: List[str] = field(default_factory=list)
+
+
+class OptimizadorPrescriptivo:
+    """
+    Prescripción: calcula la configuración mínima de sesiones para alcanzar
+    los objetivos definidos por el usuario.
+
+    A diferencia de OptimizadorInverso (que busca sesiones para UNA especialidad),
+    este optimizador trabaja a nivel global, distribuyendo sesiones extra entre
+    todas las especialidades según el flujo predicho.
+
+    Flujo:
+        1. Recibe flujo semanal del PredictorDemanda (obtener_flujo_semanal())
+        2. Recibe objetivo del usuario (ObjetivoPrescripcion)
+        3. Calcula sesiones extra mínimas por especialidad
+        4. Valida con simulación Monte Carlo
+    """
+
+    def __init__(self, simulador_mc: SimuladorMonteCarlo,
+                 modelo_capacidad: ModeloCapacidad,
+                 flujo_predicho: Dict[str, Dict[str, float]]):
+        """
+        Args:
+            simulador_mc: Simulador Monte Carlo para validación
+            modelo_capacidad: Modelo de capacidad actual
+            flujo_predicho: Resultado de PredictorDemanda.obtener_flujo_semanal()
+        """
+        self.simulador = simulador_mc
+        self.modelo_capacidad = modelo_capacidad
+        self.flujo = flujo_predicho
+
+    def prescribir(self, objetivo: ObjetivoPrescripcion) -> ResultadoPrescripcion:
+        """
+        Calcula la configuración de sesiones necesaria para cumplir el objetivo.
+
+        Args:
+            objetivo: Objetivo definido por el usuario
+
+        Returns:
+            ResultadoPrescripcion con sesiones recomendadas y proyección
+        """
+        # 1. Calcular capacidad actual por especialidad
+        capacidad_actual = self.modelo_capacidad.calcular_capacidad_semanal()
+
+        # 2. Obtener flujo de entrada predicho
+        flujo_entrada = {esp: datos['entradas_media']
+                         for esp, datos in self.flujo.items()}
+
+        # 3. Calcular sesiones extra según tipo de objetivo
+        if objetivo.tipo == TipoObjetivo.EQUILIBRAR_FLUJO:
+            sesiones_extra = self._calcular_equilibrio_flujo(
+                flujo_entrada, capacidad_actual)
+        elif objetivo.tipo in (TipoObjetivo.ELIMINAR_FUERA_PLAZO,
+                               TipoObjetivo.REDUCIR_FUERA_PLAZO):
+            sesiones_extra = self._calcular_reduccion_fp(
+                flujo_entrada, capacidad_actual, objetivo)
+        elif objetivo.tipo == TipoObjetivo.REDUCIR_LISTA:
+            sesiones_extra = self._calcular_reduccion_lista(
+                flujo_entrada, capacidad_actual, objetivo)
+        else:
+            sesiones_extra = {}
+
+        # 4. Aplicar límite máximo
+        sesiones_extra = {esp: min(n, objetivo.max_sesiones_extra)
+                          for esp, n in sesiones_extra.items() if n > 0}
+
+        # 5. Validar con simulación Monte Carlo
+        simulacion = None
+        prob_exito = 0.0
+        lista_final = self.simulador.lista_actual
+        fp_final = self.simulador.fp_actual
+
+        if sesiones_extra:
+            escenario = Escenario(
+                nombre="Prescripción óptima",
+                tipo=TipoEscenario.AÑADIR_SESIONES,
+                sesiones_extra=sesiones_extra,
+                semanas_duracion=objetivo.semanas
+            )
+            simulacion = self.simulador.simular(escenario, n_simulaciones=300)
+            lista_final = simulacion.lista_final_media
+            fp_final = simulacion.fp_final_media
+            prob_exito = self._calcular_prob_exito(simulacion, objetivo)
+
+        # 6. Generar comparación de capacidad
+        comparacion = {}
+        for esp in set(flujo_entrada.keys()) | set(capacidad_actual.keys()):
+            cap = capacidad_actual.get(esp, {})
+            cap_actual = cap.get('cirugias_estimadas', 0) if isinstance(cap, dict) else 0
+            extra = sesiones_extra.get(esp, 0)
+            cirugias_por_sesion = 4  # Estimación conservadora
+            comparacion[esp] = {
+                'actual': cap_actual,
+                'recomendada': cap_actual + extra * cirugias_por_sesion,
+                'sesiones_extra': extra,
+                'entradas': flujo_entrada.get(esp, 0),
+            }
+
+        # 7. Generar explicaciones
+        explicacion = self._generar_explicacion(
+            objetivo, sesiones_extra, flujo_entrada, comparacion, prob_exito)
+
+        return ResultadoPrescripcion(
+            objetivo=objetivo,
+            sesiones_recomendadas=sesiones_extra,
+            lista_final_esperada=lista_final,
+            fp_final_esperado=fp_final,
+            prob_exito=prob_exito,
+            flujo_entrada=flujo_entrada,
+            comparacion_capacidad=comparacion,
+            simulacion=simulacion,
+            explicacion=explicacion,
+        )
+
+    def _calcular_equilibrio_flujo(
+            self, flujo_entrada: Dict[str, float],
+            capacidad_actual: Dict) -> Dict[str, int]:
+        """
+        Calcula sesiones extra para equilibrar entradas = salidas.
+        Objetivo: que la lista no crezca.
+        """
+        sesiones_extra = {}
+        for esp, entradas in flujo_entrada.items():
+            cap = capacidad_actual.get(esp, {})
+            salidas = cap.get('cirugias_estimadas', 0) if isinstance(cap, dict) else 0
+            deficit = entradas - salidas
+
+            if deficit > 0:
+                cirugias_por_sesion = 4
+                sesiones_necesarias = int(np.ceil(deficit / cirugias_por_sesion))
+                sesiones_extra[esp] = sesiones_necesarias
+
+        return sesiones_extra
+
+    def _calcular_reduccion_fp(
+            self, flujo_entrada: Dict[str, float],
+            capacidad_actual: Dict,
+            objetivo: ObjetivoPrescripcion) -> Dict[str, int]:
+        """
+        Calcula sesiones para reducir/eliminar fuera de plazo.
+        Estrategia: equilibrar flujo + excedente para drenar FP existentes.
+        """
+        # Primero equilibrar flujo
+        sesiones_equilibrio = self._calcular_equilibrio_flujo(
+            flujo_entrada, capacidad_actual)
+
+        # Luego calcular excedente para drenar FP
+        fp_a_reducir = self.simulador.fp_actual * (objetivo.reduccion_fp_pct / 100.0)
+        cirugias_extra_total = fp_a_reducir / max(1, objetivo.semanas)
+
+        # Distribuir excedente proporcional a las entradas
+        total_entradas = sum(flujo_entrada.values())
+        sesiones_extra = dict(sesiones_equilibrio)
+
+        if total_entradas > 0:
+            cirugias_por_sesion = 4
+            for esp, entradas in flujo_entrada.items():
+                proporcion = entradas / total_entradas
+                extra_drenaje = cirugias_extra_total * proporcion
+                sesiones_drenaje = int(np.ceil(extra_drenaje / cirugias_por_sesion))
+                sesiones_extra[esp] = sesiones_extra.get(esp, 0) + sesiones_drenaje
+
+        return sesiones_extra
+
+    def _calcular_reduccion_lista(
+            self, flujo_entrada: Dict[str, float],
+            capacidad_actual: Dict,
+            objetivo: ObjetivoPrescripcion) -> Dict[str, int]:
+        """
+        Calcula sesiones para reducir la lista en un porcentaje dado.
+        """
+        # Equilibrar flujo primero
+        sesiones_equilibrio = self._calcular_equilibrio_flujo(
+            flujo_entrada, capacidad_actual)
+
+        # Calcular cuántos pacientes drenar
+        pacientes_a_drenar = self.simulador.lista_actual * (objetivo.reduccion_lista_pct / 100.0)
+        cirugias_extra_total = pacientes_a_drenar / max(1, objetivo.semanas)
+
+        total_entradas = sum(flujo_entrada.values())
+        sesiones_extra = dict(sesiones_equilibrio)
+
+        if total_entradas > 0:
+            cirugias_por_sesion = 4
+            for esp, entradas in flujo_entrada.items():
+                proporcion = entradas / total_entradas
+                extra = cirugias_extra_total * proporcion
+                sesiones_extra[esp] = sesiones_extra.get(esp, 0) + int(np.ceil(extra / cirugias_por_sesion))
+
+        return sesiones_extra
+
+    def _calcular_prob_exito(self, simulacion: ResultadoSimulacion,
+                              objetivo: ObjetivoPrescripcion) -> float:
+        """Calcula probabilidad de éxito según el tipo de objetivo"""
+        if objetivo.tipo == TipoObjetivo.ELIMINAR_FUERA_PLAZO:
+            return simulacion.prob_eliminar_fp
+        elif objetivo.tipo == TipoObjetivo.REDUCIR_FUERA_PLAZO:
+            # Aproximación: si FP final <= objetivo, consideramos éxito
+            fp_objetivo = self.simulador.fp_actual * (1 - objetivo.reduccion_fp_pct / 100.0)
+            if simulacion.fp_final_media <= fp_objetivo:
+                return min(1.0, simulacion.prob_eliminar_fp + 0.3)
+            return simulacion.prob_eliminar_fp
+        elif objetivo.tipo == TipoObjetivo.EQUILIBRAR_FLUJO:
+            return simulacion.prob_reducir_lista
+        elif objetivo.tipo == TipoObjetivo.REDUCIR_LISTA:
+            return simulacion.prob_reducir_lista
+        return 0.0
+
+    def _generar_explicacion(self, objetivo: ObjetivoPrescripcion,
+                              sesiones_extra: Dict[str, int],
+                              flujo_entrada: Dict[str, float],
+                              comparacion: Dict,
+                              prob_exito: float) -> List[str]:
+        """Genera explicación legible del resultado"""
+        explicacion = []
+
+        total_sesiones = sum(sesiones_extra.values())
+        if total_sesiones == 0:
+            explicacion.append(
+                "La configuración actual ya cumple el objetivo. "
+                "No se necesitan sesiones adicionales."
+            )
+            return explicacion
+
+        tipo_texto = {
+            TipoObjetivo.ELIMINAR_FUERA_PLAZO: "eliminar pacientes fuera de plazo",
+            TipoObjetivo.REDUCIR_FUERA_PLAZO:
+                f"reducir fuera de plazo en {objetivo.reduccion_fp_pct:.0f}%",
+            TipoObjetivo.EQUILIBRAR_FLUJO: "equilibrar entradas y salidas",
+            TipoObjetivo.REDUCIR_LISTA:
+                f"reducir la lista de espera en {objetivo.reduccion_lista_pct:.0f}%",
+        }
+
+        explicacion.append(
+            f"Para **{tipo_texto.get(objetivo.tipo, 'el objetivo')}** "
+            f"en {objetivo.semanas} semanas, se necesitan "
+            f"**{total_sesiones} sesiones extra/semana** distribuidas entre "
+            f"{len(sesiones_extra)} especialidades."
+        )
+
+        # Desglose por especialidad (ordenado por sesiones descendente)
+        for esp, n in sorted(sesiones_extra.items(), key=lambda x: -x[1]):
+            comp = comparacion.get(esp, {})
+            ent = flujo_entrada.get(esp, 0)
+            sal_actual = comp.get('actual', 0)
+            explicacion.append(
+                f"  - **{esp}**: +{n} sesiones/sem "
+                f"(entradas: {ent:.0f}/sem, capacidad actual: {sal_actual:.0f}/sem)"
+            )
+
+        if prob_exito >= objetivo.confianza:
+            explicacion.append(
+                f"Probabilidad de éxito: **{prob_exito:.0%}** "
+                f"(cumple umbral de {objetivo.confianza:.0%})"
+            )
+        else:
+            explicacion.append(
+                f"**Atención**: probabilidad de éxito {prob_exito:.0%} "
+                f"está por debajo del umbral {objetivo.confianza:.0%}. "
+                f"Considerar más sesiones o ampliar el horizonte temporal."
+            )
+
+        return explicacion
 
 
 # =============================================================================
