@@ -727,6 +727,45 @@ class PredictorDemanda:
             recomendaciones=recomendaciones
         )
     
+    def obtener_flujo_semanal(self) -> Dict[str, Dict[str, float]]:
+        """
+        Devuelve las tasas de flujo semanal aprendidas por especialidad.
+
+        Permite al módulo de prescripción consumir los datos de predicción
+        sin acoplar los dos módulos. Esto es la interfaz entre predicción
+        y prescripción.
+
+        Returns:
+            Dict por especialidad con:
+                - entradas_media: pacientes/semana entrando
+                - entradas_std: desviación estándar
+                - salidas_media: pacientes/semana operados (capacidad histórica)
+                - salidas_std: desviación estándar
+                - balance: entradas - salidas (positivo = lista crece)
+        """
+        if not self.modelo_entrenado:
+            self.entrenar()
+
+        flujo = {}
+        todas_especialidades = set(self.tasas_entrada.keys()) | set(self.tasas_salida.keys())
+
+        for esp in todas_especialidades:
+            ent = self.tasas_entrada.get(esp, {})
+            sal = self.tasas_salida.get(esp, {})
+
+            ent_media = ent.get('media', 0)
+            sal_media = sal.get('media', 0)
+
+            flujo[esp] = {
+                'entradas_media': ent_media,
+                'entradas_std': ent.get('std', ent_media * 0.2),
+                'salidas_media': sal_media,
+                'salidas_std': sal.get('std', sal_media * 0.2),
+                'balance': ent_media - sal_media,
+            }
+
+        return flujo
+
     def generar_informe(self, resultado: ResultadoPrediccion) -> str:
         """Genera un informe textual de la predicción"""
         

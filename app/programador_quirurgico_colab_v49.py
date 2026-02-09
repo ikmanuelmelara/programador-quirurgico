@@ -93,8 +93,9 @@ SIMULADOR_DISPONIBLE = False
 simulador_whatif = None
 try:
     from simulador_whatif import (
-        SimuladorWhatIf, Escenario, TipoEscenario, 
-        ResultadoSimulacion, crear_escenario_rapido
+        SimuladorWhatIf, Escenario, TipoEscenario,
+        ResultadoSimulacion, crear_escenario_rapido,
+        ObjetivoPrescripcion, TipoObjetivo, ResultadoPrescripcion
     )
     SIMULADOR_DISPONIBLE = True
     print(f"✅ Simulador What-If disponible")
@@ -4009,6 +4010,179 @@ def ejecutar_planificacion_estrategica(horizonte_semanas):
 
 
 # =============================================================================
+# FUNCIONES DE PRESCRIPCIÓN (E1 - Separación Predicción/Prescripción)
+# =============================================================================
+
+def ejecutar_prescripcion(tipo_objetivo, reduccion_fp_pct, reduccion_lista_pct,
+                          horizonte_semanas, confianza, max_sesiones):
+    """
+    Ejecuta la prescripción: calcula la configuración óptima de sesiones
+    para cumplir el objetivo definido por el usuario.
+
+    Flujo: Predicción (flujo aprendido) -> Prescripción (sesiones necesarias)
+    """
+    global simulador_whatif, predictor_demanda
+
+    if not SIMULADOR_DISPONIBLE:
+        return ("⚠️ **Simulador no disponible.** Asegúrate de tener `simulador_whatif.py`.",
+                None, None, pd.DataFrame())
+
+    if not PREDICTOR_DEMANDA_DISPONIBLE or predictor_demanda is None:
+        return ("⚠️ **Predictor de demanda no disponible.** "
+                "La prescripción necesita la predicción de flujo para funcionar.",
+                None, None, pd.DataFrame())
+
+    try:
+        # 1. Inicializar simulador si necesario
+        if simulador_whatif is None:
+            simulador_whatif = inicializar_simulador()
+            if simulador_whatif is None:
+                return ("❌ Error inicializando simulador", None, None, pd.DataFrame())
+
+        # 2. Conectar flujo predicho al prescriptor
+        flujo = predictor_demanda.obtener_flujo_semanal()
+        simulador_whatif.set_flujo_predicho(flujo)
+
+        # 3. Construir objetivo
+        mapa_tipos = {
+            "Eliminar fuera de plazo": TipoObjetivo.ELIMINAR_FUERA_PLAZO,
+            "Reducir fuera de plazo": TipoObjetivo.REDUCIR_FUERA_PLAZO,
+            "Equilibrar flujo (entradas = salidas)": TipoObjetivo.EQUILIBRAR_FLUJO,
+            "Reducir lista de espera": TipoObjetivo.REDUCIR_LISTA,
+        }
+        tipo = mapa_tipos.get(tipo_objetivo, TipoObjetivo.EQUILIBRAR_FLUJO)
+
+        objetivo = ObjetivoPrescripcion(
+            tipo=tipo,
+            reduccion_fp_pct=float(reduccion_fp_pct),
+            reduccion_lista_pct=float(reduccion_lista_pct),
+            semanas=int(horizonte_semanas),
+            confianza=float(confianza) / 100.0,
+            max_sesiones_extra=int(max_sesiones),
+        )
+
+        # 4. Ejecutar prescripción
+        resultado = simulador_whatif.prescribir(objetivo)
+
+        # 5. Generar markdown de resultados
+        lista_actual, fp_actual = obtener_stats_lista_espera()
+
+        md = f"""
+## 💊 Prescripción: Configuración Recomendada
+
+### 🎯 Objetivo
+**{tipo_objetivo}** en **{int(horizonte_semanas)} semanas** (confianza: {confianza:.0f}%)
+
+### 📊 Estado Actual vs Proyección
+| Métrica | Actual | Proyección | Cambio |
+|---------|--------|------------|--------|
+| Lista de espera | {lista_actual} | {resultado.lista_final_esperada:.0f} | {resultado.lista_final_esperada - lista_actual:+.0f} |
+| Fuera de plazo | {fp_actual} | {resultado.fp_final_esperado:.0f} | {resultado.fp_final_esperado - fp_actual:+.0f} |
+| Prob. éxito | — | **{resultado.prob_exito:.0%}** | — |
+
+### 📋 Sesiones Recomendadas
+| Especialidad | Entradas/sem | Cap. Actual | Cap. Recomendada | Sesiones Extra |
+|--------------|-------------|-------------|------------------|----------------|
+"""
+        for esp in sorted(resultado.comparacion_capacidad.keys(),
+                          key=lambda e: resultado.sesiones_recomendadas.get(e, 0),
+                          reverse=True):
+            comp = resultado.comparacion_capacidad[esp]
+            nombre = ESPECIALIDADES_NOMBRES.get(esp, esp)
+            extra = resultado.sesiones_recomendadas.get(esp, 0)
+            indicador = "🔴" if extra > 0 else "🟢"
+            md += (f"| {indicador} {nombre} | {comp.get('entradas', 0):.0f} | "
+                   f"{comp.get('actual', 0):.0f} | {comp.get('recomendada', 0):.0f} | "
+                   f"**+{extra}** |\n")
+
+        total_extra = sum(resultado.sesiones_recomendadas.values())
+        md += f"\n**Total sesiones extra necesarias: {total_extra}/semana**\n"
+
+        # Explicaciones
+        if resultado.explicacion:
+            md += "\n### 💡 Análisis\n\n"
+            for exp in resultado.explicacion:
+                md += f"- {exp}\n"
+
+        # 6. Gráfico de comparación de capacidad
+        fig_capacidad = go.Figure()
+        esps_con_datos = [e for e in resultado.comparacion_capacidad
+                          if resultado.comparacion_capacidad[e].get('entradas', 0) > 0
+                          or resultado.comparacion_capacidad[e].get('actual', 0) > 0]
+        esps_con_datos.sort(key=lambda e: resultado.sesiones_recomendadas.get(e, 0), reverse=True)
+
+        nombres = [ESPECIALIDADES_NOMBRES.get(e, e)[:12] for e in esps_con_datos]
+        entradas = [resultado.comparacion_capacidad[e].get('entradas', 0) for e in esps_con_datos]
+        cap_actual = [resultado.comparacion_capacidad[e].get('actual', 0) for e in esps_con_datos]
+        cap_recom = [resultado.comparacion_capacidad[e].get('recomendada', 0) for e in esps_con_datos]
+
+        fig_capacidad.add_trace(go.Bar(name='Entradas/sem', x=nombres, y=entradas,
+                                       marker_color='#e74c3c'))
+        fig_capacidad.add_trace(go.Bar(name='Cap. Actual', x=nombres, y=cap_actual,
+                                       marker_color='#95a5a6'))
+        fig_capacidad.add_trace(go.Bar(name='Cap. Recomendada', x=nombres, y=cap_recom,
+                                       marker_color='#27ae60'))
+        fig_capacidad.update_layout(
+            title='Entradas vs Capacidad (actual y recomendada)',
+            barmode='group', height=400,
+            xaxis_title='Especialidad', yaxis_title='Pacientes/semana'
+        )
+
+        # 7. Gráfico de proyección temporal (si hay simulación)
+        fig_proyeccion = None
+        if resultado.simulacion:
+            fig_proyeccion = go.Figure()
+            semanas_x = resultado.simulacion.semanas
+
+            # Banda de confianza
+            fig_proyeccion.add_trace(go.Scatter(
+                x=semanas_x + semanas_x[::-1],
+                y=resultado.simulacion.lista_ic_alto + resultado.simulacion.lista_ic_bajo[::-1],
+                fill='toself', fillcolor='rgba(39, 174, 96, 0.15)',
+                line=dict(color='rgba(255,255,255,0)'),
+                name='IC 80%', showlegend=True
+            ))
+
+            fig_proyeccion.add_trace(go.Scatter(
+                x=semanas_x, y=resultado.simulacion.lista_espera,
+                mode='lines+markers', name='Lista (con prescripción)',
+                line=dict(color='#27ae60', width=3), marker=dict(size=6)
+            ))
+
+            fig_proyeccion.add_trace(go.Scatter(
+                x=semanas_x, y=resultado.simulacion.fuera_plazo,
+                mode='lines', name='Fuera Plazo',
+                line=dict(color='#e74c3c', width=2, dash='dash')
+            ))
+
+            fig_proyeccion.add_hline(y=lista_actual, line_dash="dot",
+                                     line_color="gray", annotation_text="Lista actual")
+            fig_proyeccion.update_layout(
+                title='Proyección con Configuración Prescrita',
+                xaxis_title='Semana', yaxis_title='Pacientes', height=400
+            )
+
+        # 8. Tabla resumen
+        datos_tabla = []
+        for esp, comp in resultado.comparacion_capacidad.items():
+            if comp.get('entradas', 0) > 0 or comp.get('actual', 0) > 0:
+                datos_tabla.append({
+                    'Especialidad': ESPECIALIDADES_NOMBRES.get(esp, esp),
+                    'Entradas/sem': f"{comp.get('entradas', 0):.0f}",
+                    'Cap. Actual': f"{comp.get('actual', 0):.0f}",
+                    'Cap. Recomendada': f"{comp.get('recomendada', 0):.0f}",
+                    'Sesiones Extra': f"+{resultado.sesiones_recomendadas.get(esp, 0)}",
+                    'Balance': f"{comp.get('recomendada', 0) - comp.get('entradas', 0):+.0f}",
+                })
+
+        return md, fig_capacidad, fig_proyeccion, pd.DataFrame(datos_tabla)
+
+    except Exception as e:
+        import traceback
+        return f"❌ Error en prescripción: {str(e)}\n{traceback.format_exc()}", None, None, pd.DataFrame()
+
+
+# =============================================================================
 # FUNCIONES DE UI PARA TABS NUEVOS
 # =============================================================================
 
@@ -4222,7 +4396,7 @@ print("\n🚀 Construyendo interfaz...")
 with gr.Blocks(title="Programador Quirúrgico v4.9") as demo:
     gr.Markdown("""
     # 🏥 Programador Quirúrgico v4.9
-    ### Flujo: 📊 Análisis → 🎯 Planificación → ⚙️ Configuración → 📅 Ejecución
+    ### Flujo: 📊 Análisis → 📈 Predicción → 💊 Prescripción → ⚙️ Configuración → 📅 Ejecución
     """)
     
     with gr.Tabs():
@@ -4246,92 +4420,169 @@ with gr.Blocks(title="Programador Quirúrgico v4.9") as demo:
             lista_df = gr.Dataframe()
             btn_lista.click(mostrar_lista_espera, outputs=[lista_df])
         
-        # TAB PREDICCIÓN DEMANDA
-        with gr.TabItem("📈 Pred. Demanda"):
+        # TAB PREDICCIÓN (agrupa demanda + urgencias)
+        with gr.TabItem("📈 Predicción"):
             gr.Markdown("""
-            ### 📈 Predicción de Movimientos de Lista de Espera
-            
-            Analiza cómo evolucionará la lista basándose en entradas y salidas históricas.
+            ### 📈 Predicción: ¿Qué pasará si no hacemos nada?
+
+            Analiza tendencias y proyecta la evolución de la lista de espera
+            basándose en datos históricos. **No recomienda acciones** — para eso
+            usa la pestaña **💊 Prescripción**.
             """)
-            
-            with gr.Row():
-                pred_semanas = gr.Slider(4, 24, 12, step=2, label="Semanas a predecir")
-                pred_lista = gr.Number(value=500, label="Lista actual (override)")
-                pred_fp = gr.Number(value=50, label="Fuera plazo actual")
-            
-            btn_pred_dem = gr.Button("📈 Ejecutar Predicción", variant="primary", size="lg")
-            
-            pred_dem_md = gr.Markdown()
-            with gr.Row():
-                pred_dem_fig1 = gr.Plot()
-                pred_dem_fig2 = gr.Plot()
-            pred_dem_tabla = gr.Dataframe()
-            
-            btn_pred_dem.click(ejecutar_prediccion_demanda,
-                              inputs=[pred_semanas, pred_lista, pred_fp],
-                              outputs=[pred_dem_md, pred_dem_fig1, pred_dem_fig2, pred_dem_tabla])
-        
+
+            with gr.Tabs():
+                with gr.TabItem("📊 Evolución Lista"):
+                    with gr.Row():
+                        pred_semanas = gr.Slider(4, 24, 12, step=2, label="Semanas a predecir")
+                        pred_lista = gr.Number(value=500, label="Lista actual (override)")
+                        pred_fp = gr.Number(value=50, label="Fuera plazo actual")
+
+                    btn_pred_dem = gr.Button("📈 Ejecutar Predicción", variant="primary", size="lg")
+
+                    pred_dem_md = gr.Markdown()
+                    with gr.Row():
+                        pred_dem_fig1 = gr.Plot()
+                        pred_dem_fig2 = gr.Plot()
+                    pred_dem_tabla = gr.Dataframe()
+
+                    btn_pred_dem.click(ejecutar_prediccion_demanda,
+                                      inputs=[pred_semanas, pred_lista, pred_fp],
+                                      outputs=[pred_dem_md, pred_dem_fig1, pred_dem_fig2, pred_dem_tabla])
+
+                with gr.TabItem("🚑 Urgencias Diferidas"):
+                    gr.Markdown("ML para predecir cuánto tiempo reservar en cada sesión para urgencias.")
+                    with gr.Tabs():
+                        with gr.TabItem("📊 Resumen"):
+                            btn_pred_urg = gr.Button("🔄 Calcular Predicción", variant="primary")
+                            pred_urg_md = gr.Markdown()
+                            pred_urg_df = gr.Dataframe()
+                            pred_urg_fig = gr.Plot()
+                            btn_pred_urg.click(mostrar_prediccion_urgencias, outputs=[pred_urg_md, pred_urg_df, pred_urg_fig])
+
+                        with gr.TabItem("📅 Semanal"):
+                            btn_pred_sem = gr.Button("📅 Predicción Semanal", variant="primary")
+                            pred_sem_md = gr.Markdown()
+                            pred_sem_df = gr.Dataframe()
+                            btn_pred_sem.click(mostrar_prediccion_semanal, outputs=[pred_sem_md, pred_sem_df])
+
+                        with gr.TabItem("⚙️ Aplicar"):
+                            gr.Markdown("Aplica las reservas calculadas por ML al optimizador")
+                            btn_aplicar_res = gr.Button("✅ Aplicar Reservas ML", variant="primary", size="lg")
+                            aplicar_res_md = gr.Markdown()
+                            btn_aplicar_res.click(aplicar_reservas_ml, outputs=[aplicar_res_md])
+
         # =====================================================================
         # FASE 2: PLANIFICACIÓN ESTRATÉGICA - ¿Qué debería hacer?
         # =====================================================================
-        
-        # TAB PLANIFICADOR ESTRATÉGICO (NUEVO)
+
+        # TAB PRESCRIPCIÓN (nuevo - reemplaza al antiguo Planificador)
+        with gr.TabItem("💊 Prescripción"):
+            gr.Markdown("""
+            ### 💊 Prescripción: ¿Qué debo hacer para conseguir mi objetivo?
+
+            Define tu objetivo y el sistema calculará la **configuración mínima de sesiones**
+            necesaria para alcanzarlo, validada con simulación Monte Carlo.
+
+            **Requiere:** Haber ejecutado la predicción (pestaña 📈) al menos una vez.
+            """)
+
+            with gr.Row():
+                with gr.Column(scale=2):
+                    presc_objetivo = gr.Dropdown(
+                        choices=[
+                            "Eliminar fuera de plazo",
+                            "Reducir fuera de plazo",
+                            "Equilibrar flujo (entradas = salidas)",
+                            "Reducir lista de espera",
+                        ],
+                        value="Equilibrar flujo (entradas = salidas)",
+                        label="🎯 Objetivo"
+                    )
+                    presc_horizonte = gr.Slider(4, 24, 12, step=2,
+                                               label="Horizonte (semanas)")
+                with gr.Column(scale=1):
+                    presc_red_fp = gr.Slider(10, 100, 100, step=10,
+                                            label="% reducción FP (si aplica)")
+                    presc_red_lista = gr.Slider(5, 50, 20, step=5,
+                                               label="% reducción lista (si aplica)")
+                    presc_confianza = gr.Slider(50, 95, 80, step=5,
+                                               label="Confianza requerida (%)")
+                    presc_max_ses = gr.Slider(1, 15, 10, step=1,
+                                             label="Máx. sesiones extra/esp.")
+
+            btn_prescribir = gr.Button("💊 Calcular Prescripción", variant="primary", size="lg")
+
+            presc_md = gr.Markdown()
+            with gr.Row():
+                presc_fig_cap = gr.Plot()
+                presc_fig_proy = gr.Plot()
+            presc_tabla = gr.Dataframe()
+
+            btn_prescribir.click(ejecutar_prescripcion,
+                                inputs=[presc_objetivo, presc_red_fp, presc_red_lista,
+                                        presc_horizonte, presc_confianza, presc_max_ses],
+                                outputs=[presc_md, presc_fig_cap, presc_fig_proy, presc_tabla])
+
+        # TAB PLANIFICADOR ESTRATÉGICO (legacy, mantenido por compatibilidad)
         with gr.TabItem("🎯 Planificador"):
             gr.Markdown("""
-            ### 🎯 Planificador Estratégico
-            
+            ### 🎯 Planificador Estratégico (Legacy)
+
+            > **Nota:** Para la nueva lógica separada de predicción/prescripción,
+            > usa las pestañas **📈 Predicción** y **💊 Prescripción**.
+
             **Análisis integral:**
             1. 📊 Demanda actual por especialidad
             2. 🔄 Reparto óptimo de sesiones
             3. 🔮 Simulación What-If con Monte Carlo
             4. 💡 Recomendaciones concretas
             """)
-            
+
             plan_horizonte = gr.Slider(4, 24, 12, step=2, label="Horizonte (semanas)")
             btn_planificar = gr.Button("🎯 Ejecutar Planificación Estratégica", variant="primary", size="lg")
-            
+
             plan_md = gr.Markdown()
             with gr.Row():
                 plan_fig_sesiones = gr.Plot()
                 plan_fig_proyeccion = gr.Plot()
-            
+
             plan_tabla = gr.Dataframe()
             plan_msg = gr.Markdown()
             btn_aplicar_plan = gr.Button("✅ Aplicar Configuración Óptima", variant="secondary")
-            
+
             def aplicar_config_simple():
                 """Aplica la configuración óptima y retorna solo mensaje"""
                 global configuracion_optima_calculada
                 if configuracion_optima_calculada is None:
                     return "⚠️ Primero ejecuta la planificación estratégica"
-                
+
                 # Aplicar configuración
                 for q, datos in configuracion_optima_calculada.items():
                     if isinstance(q, int) and q in configuracion_sesiones:
                         for dia in DIAS_SEMANA:
                             if dia in datos:
                                 configuracion_sesiones[q][dia] = datos[dia].copy()
-                
+
                 return "✅ **Configuración óptima aplicada.** Ve a la pestaña '🗓️ Sesiones' para ver los cambios."
-            
+
             btn_planificar.click(ejecutar_planificacion_estrategica,
                                 inputs=[plan_horizonte],
                                 outputs=[plan_md, plan_fig_sesiones, plan_fig_proyeccion, plan_tabla, plan_msg])
             btn_aplicar_plan.click(aplicar_config_simple, outputs=[plan_msg])
-        
+
         # TAB SIMULADOR WHAT-IF
         with gr.TabItem("🔮 What-If"):
             gr.Markdown("""
             ### 🔮 Simulador de Escenarios What-If
-            
+
             Simula: *¿Qué pasa si añado sesiones? ¿Si cierro un quirófano?*
             """)
-            
+
             with gr.Tabs():
                 with gr.TabItem("📊 Simular"):
                     with gr.Row():
                         with gr.Column():
-                            tipo_esc = gr.Dropdown(choices=["Añadir sesiones", "Quitar sesiones", 
+                            tipo_esc = gr.Dropdown(choices=["Añadir sesiones", "Quitar sesiones",
                                                            "Cerrar quirófano", "Cambio demanda"],
                                                   value="Añadir sesiones", label="Tipo")
                             esp_sim = gr.Dropdown(choices=[e for e in LISTA_ESPECIALIDADES if e not in ['LIBRE','CERRADO']],
@@ -4341,18 +4592,18 @@ with gr.Blocks(title="Programador Quirúrgico v4.9") as demo:
                             q_cerrar = gr.Slider(1, 8, 3, step=1, label="Quirófano a cerrar")
                             f_dem = gr.Slider(0.7, 1.5, 1.0, step=0.05, label="Factor demanda")
                             sem_sim = gr.Slider(4, 24, 12, step=2, label="Semanas")
-                    
+
                     btn_sim = gr.Button("🔮 Simular", variant="primary", size="lg")
                     sim_md = gr.Markdown()
                     with gr.Row():
                         sim_fig1 = gr.Plot()
                         sim_fig2 = gr.Plot()
                     sim_tabla = gr.Dataframe()
-                    
+
                     btn_sim.click(ejecutar_simulacion_whatif,
                                  inputs=[tipo_esc, esp_sim, n_ses, q_cerrar, f_dem, sem_sim],
                                  outputs=[sim_md, sim_fig1, sim_fig2, sim_tabla])
-                
+
                 with gr.TabItem("📈 Comparar"):
                     with gr.Row():
                         esp_comp = gr.Dropdown(choices=[e for e in LISTA_ESPECIALIDADES if e not in ['LIBRE','CERRADO']],
@@ -4364,7 +4615,7 @@ with gr.Blocks(title="Programador Quirúrgico v4.9") as demo:
                     comp_tabla = gr.Dataframe()
                     btn_comp.click(comparar_escenarios_whatif, inputs=[esp_comp, sem_comp],
                                   outputs=[comp_md, comp_fig, comp_tabla])
-                
+
                 with gr.TabItem("🎯 Calculadora"):
                     gr.Markdown("### ¿Cuántas sesiones necesito para eliminar FP?")
                     with gr.Row():
@@ -4374,33 +4625,6 @@ with gr.Blocks(title="Programador Quirúrgico v4.9") as demo:
                     btn_calc = gr.Button("🎯 Calcular", variant="primary")
                     calc_md = gr.Markdown()
                     btn_calc.click(calcular_sesiones_necesarias_ui, inputs=[esp_calc, sem_calc], outputs=[calc_md])
-        
-        # TAB PREDICCIÓN URGENCIAS
-        with gr.TabItem("🚑 Pred. Urgencias"):
-            gr.Markdown("""
-            ### 🔮 Predicción de Urgencias Diferidas
-            
-            ML para predecir cuánto tiempo reservar en cada sesión para urgencias.
-            """)
-            with gr.Tabs():
-                with gr.TabItem("📊 Resumen"):
-                    btn_pred_urg = gr.Button("🔄 Calcular Predicción", variant="primary")
-                    pred_urg_md = gr.Markdown()
-                    pred_urg_df = gr.Dataframe()
-                    pred_urg_fig = gr.Plot()
-                    btn_pred_urg.click(mostrar_prediccion_urgencias, outputs=[pred_urg_md, pred_urg_df, pred_urg_fig])
-                
-                with gr.TabItem("📅 Semanal"):
-                    btn_pred_sem = gr.Button("📅 Predicción Semanal", variant="primary")
-                    pred_sem_md = gr.Markdown()
-                    pred_sem_df = gr.Dataframe()
-                    btn_pred_sem.click(mostrar_prediccion_semanal, outputs=[pred_sem_md, pred_sem_df])
-                
-                with gr.TabItem("⚙️ Aplicar"):
-                    gr.Markdown("Aplica las reservas calculadas por ML al optimizador")
-                    btn_aplicar_res = gr.Button("✅ Aplicar Reservas ML", variant="primary", size="lg")
-                    aplicar_res_md = gr.Markdown()
-                    btn_aplicar_res.click(aplicar_reservas_ml, outputs=[aplicar_res_md])
         
         # =====================================================================
         # FASE 3: CONFIGURACIÓN TÁCTICA - ¿Cómo lo configuro?
